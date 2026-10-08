@@ -5,6 +5,20 @@ for a split second, reconnects, or the VPN app sends that traffic "direct", the 
 drops the packets. There is no reaction window: the decision is made on every packet, not by
 a script that has to notice something first.
 
+**IPv4 only.** Turn IPv6 off yourself before you rely on this lock. The installer does not
+do it. macOS has no "Off" for IPv6 in System Settings. For every service you actually use
+(Wi-Fi, Ethernet, iPhone USB, …):
+
+```bash
+networksetup -listallnetworkservices
+sudo networksetup -setv6off "Wi-Fi"
+```
+
+The name in quotes is the one from that list. Check with `ifconfig en0 | grep inet6`: there
+should be no `inet6` line. Put it back later with `sudo networksetup -setv6automatic "Wi-Fi"`.
+System Settings → Network → the service → Details → TCP/IP → Configure IPv6 → **Link-local
+only** is not off: the interface still keeps an `fe80::` address. Use `-setv6off`.
+
 The table starts with Anthropic's nets and adds dedicated addresses the daemon resolves
 (Claude updates and content hosts, Datadog intake, and any other listed name that is not a
 shared CDN). Cloudflare, CloudFront and Fastly answers stay uncovered: one such address
@@ -127,7 +141,7 @@ sudo bash uninstall.sh             # removes everything and compares the machine
 | Something replaces the whole pf ruleset without the stock `com.apple/*` hook (another VPN's kill switch, a custom `pf.conf`) | **the lock cannot work.** Noticed within 60 s: log entry and a notification |
 | The daemon crashes | the last rule stays; launchd restarts the daemon after 5 s (`ThrottleInterval`) |
 | Boot | starts closed until a tunnel is verified. If the saved open rule still matches the tunnel that is already up, that rule is kept and checked without closing first |
-| IPv6 networks | Anthropic over IPv6 (`2607:6bc0::/32`) is blocked by the same rule |
+| IPv6 left on | not a supported setup. Turn IPv6 off yourself on each network service (`networksetup -setv6off`), see the top of this file |
 | Travelling without a VPN | **Claude does not work.** That is the point: only through the VPN |
 | `a-cdn.claude.ai`, `status.claude.com` without the VPN | **not covered**: they sit on Amazon CloudFront with thousands of other sites, blocking those addresses would break other sites. Static files and the status page, not requests to the model |
 | Other apps' error reports to Sentry / Datadog | Claude reports errors to shared Sentry and Datadog endpoints, so those addresses are also only allowed through the VPN. Other apps reporting to the same endpoints are affected the same way |
