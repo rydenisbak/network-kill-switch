@@ -29,6 +29,7 @@ if [ "${DRY}" = 1 ]; then
   step "Dry run: what would be done"
   cat <<PLAN
   - stop and unload the daemon ${CVL_LABEL}, delete ${CVL_PLIST}
+  - if the hourly watch is installed: unload ${CVL_WATCH_LABEL} before the daemon, delete ${CVL_WATCH_PLIST}
   - empty the pf anchor ${CVL_ANCHOR} (and the test anchor ${CVL_TEST_ANCHOR})
   - release our reference that keeps pf enabled (pfctl -X <token>): pf switches off only if
     nothing else holds it
@@ -47,6 +48,17 @@ PLAN
 fi
 
 [ "$(id -u)" = 0 ] || die "root is required. Run: sudo bash $0"
+
+if [ -f "${CVL_WATCH_PLIST}" ] || launchctl print "system/${CVL_WATCH_LABEL}" >/dev/null 2>&1; then
+  step "Stop the watch"
+  if bash "${SRC}/watch.sh" --pause; then
+    say "  watch stopped"
+  else
+    launchctl bootout "system/${CVL_WATCH_LABEL}" >/dev/null 2>&1 || true
+    say "  WARNING: watch unloaded, but its process is still alive"
+  fi
+  rm -f "${CVL_WATCH_PLIST}" && say "  deleted ${CVL_WATCH_PLIST}"
+fi
 
 step "Stop the daemon"
 stop_daemon
@@ -108,15 +120,20 @@ if [ -n "${LOGS}" ] && [ -s "${CVL_LOG}" ]; then
   dest="${LOGS}/daemon-$(date +%Y%m%d-%H%M%S).log"
   cp "${CVL_LOG}" "${dest}" && chown "$(cvl_user)" "${dest}" && say "  log saved: ${dest}"
 fi
-if [ -n "${LOGS}" ] && { [ -d "${CVL_SNAP}" ] || [ -f "${CVL_CONF}" ]; }; then
+if [ -n "${LOGS}" ] && { [ -d "${CVL_SNAP}" ] || [ -f "${CVL_CONF}" ] || [ -f "${CVL_TG_CONF}" ]; }; then
   keep="${LOGS}/snapshot-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "${keep}"
   cp -p "${CVL_SNAP}"/* "${keep}/" 2>/dev/null
   cp -p "${CVL_CONF}" "${keep}/" 2>/dev/null
+  if [ -f "${CVL_TG_CONF}" ]; then
+    cp -p "${CVL_TG_CONF}" "${keep}/"
+    chmod 600 "${keep}/telegram.conf" 2>/dev/null || true
+  fi
   chown -R "$(cvl_user)" "${keep}" 2>/dev/null
   say "  snapshot and settings saved: ${keep}"
 fi
-for f in "${CVL_DEST_DIR}" "${CVL_LOG}" "${CVL_LOG}.1" /var/log/network-kill-switch.out.log /var/log/network-kill-switch.err.log; do
+for f in "${CVL_DEST_DIR}" "${CVL_LOG}" "${CVL_LOG}.1" /var/log/network-kill-switch.out.log /var/log/network-kill-switch.err.log \
+         "${CVL_WATCH_LOG}" "${CVL_WATCH_ERR}"; do
   [ -e "${f}" ] && rm -rf "${f}" && say "  deleted ${f}"
 done
 

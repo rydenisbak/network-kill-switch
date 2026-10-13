@@ -170,6 +170,49 @@ tail -f /var/log/network-kill-switch.log
 - `PF rule being replaced had blocked N packets`: how many packets were dropped while that
   rule was in place.
 
+## Hourly watch
+
+Optional. A second LaunchDaemon checks at boot and once an hour that the lock is really
+enforcing: the daemon is running, pf is on, the stock `com.apple/*` anchor is in place, the
+rule and the table match the current mode, and a packet past the tunnel is dropped. VPN off
+with mode closed is success. That is the lock working, and it does not send a message.
+
+A failure is checked again until the daemon has had time to put the rule back (its
+tick plus the exit-country check, about 15–30 s). A brief gap does not alert. The same
+failure is not sent again for 10 minutes; a different one is. When a later check passes,
+one recovery message is sent, and that 10-minute wait ends. The next hour sends again
+if it is still the same failure.
+
+The template is [`lib/telegram.conf.template`](lib/telegram.conf.template). `--install`
+copies it to `/opt/network-kill-switch/telegram.conf` (root, mode 600). A copy that already
+has a token or a chat id is left as it is. Edit the copy in `/opt`, not the file in the
+repo:
+
+```
+TELEGRAM_BOT_TOKEN=""
+# chat id or user id
+TELEGRAM_CHAT_ID=""
+```
+
+```bash
+sudo bash watch.sh --install
+sudo nano /opt/network-kill-switch/telegram.conf   # fill in the two empty values
+sudo bash watch.sh --test                          # one message, to prove the chat
+sudo bash watch.sh                                 # one check now; uses the daemon in /opt
+sudo bash watch.sh --remove                        # the watch only; the lock stays
+```
+
+The settings file is read only when root owns it and nobody else can read or write it.
+Create the bot with [@BotFather](https://t.me/BotFather) (`/newbot`), send the bot any
+message, then put its token and your chat id in the copy under `/opt`. The token is the
+whole string BotFather gives you (`123456789:AAH...`). The chat id is the `"id"` under
+`"chat"` in `https://api.telegram.org/bot<token>/getUpdates`. The check itself only sends
+the usual canary to `203.0.113.7` (dropped, not a real host). Telegram is contacted only
+for an alert, a recovery, or `--test`.
+
+Removing the lock removes the watch. The bot token is copied with the other saved settings.
+Reinstalling the lock refreshes the watch script if the watch is already installed.
+
 ## What it connects to
 
 - The daemon, through the tunnel: `https://1.1.1.1/cdn-cgi/trace` every 30 s to learn the exit

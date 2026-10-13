@@ -14,7 +14,7 @@ jobs:
       - name: Scripts are plain ASCII
         run: "! LC_ALL=C grep -n '[^ -~\t]' *.sh lib/*.sh tests/*.sh"
       - name: LaunchDaemon plist
-        run: plutil -lint lib/network-kill-switch.plist
+        run: plutil -lint lib/network-kill-switch.plist lib/network-kill-switch-watch.plist
       - name: Daemon logic on fake pfctl/route/ifconfig/curl (no root, no network)
         run: /bin/bash tests/sim.sh
       - name: Dry runs and help work without root
@@ -22,3 +22,4 @@ jobs:
           /bin/bash install.sh --help
           /bin/bash install.sh --dry-run
           /bin/bash uninstall.sh --dry-run
+          /bin/bash watch.sh --help

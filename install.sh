@@ -141,7 +141,7 @@ path_trusted "${parent}" || die "${parent} or a folder above it can be changed b
 rollback() {
   say "  ROLLBACK: $*"
   bash "${SRC}/uninstall.sh" --rollback | sed 's/^/    /'
-  die "install cancelled; the lock is removed (a previous install too, if there was one); settings and the snapshot were saved to ~/Library/Logs/network-kill-switch"
+  die "install cancelled; the lock is removed (a previous install too, if there was one); settings and the snapshot were saved to ~/Library/Logs/network-kill-switch. If the hourly watch was installed, it was removed too: sudo bash '${SRC}/watch.sh' --install"
 }
 
 step "Snapshot of the machine before install"
@@ -161,6 +161,15 @@ else
 fi
 
 step "Install files (a running copy of this daemon is stopped for a few seconds; the VPN was checked above)"
+if [ -f "${CVL_WATCH_PLIST}" ] || launchctl print "system/${CVL_WATCH_LABEL}" >/dev/null 2>&1; then
+  # Unload the watch before the daemon stops, or its repair wait ends during
+  # the reinstall and it reports a failure that we caused.
+  if bash "${SRC}/watch.sh" --pause; then
+    say "  hourly watch paused until the daemon is back"
+  else
+    say "  WARNING: hourly watch unloaded, but its process is still alive"
+  fi
+fi
 stop_daemon
 case $? in
   0) say "  previous daemon stopped" ;;
@@ -168,6 +177,9 @@ case $? in
   *) say "  WARNING: previous daemon unloaded, but its process is alive after 25 s" ;;
 esac
 install -o root -g wheel -m 755 "${DAEMON_SRC}" "${CVL_DAEMON}" && say "  ${CVL_DAEMON}"
+if [ -f "${CVL_WATCH_PLIST}" ] && [ -f "${SRC}/watch.sh" ]; then
+  install -o root -g wheel -m 755 "${SRC}/watch.sh" "${CVL_WATCH}" && say "  watch script updated (${CVL_WATCH})"
+fi
 if [ ! -f "${CVL_CONF}" ]; then
   cat >"${CVL_CONF}" <<'CONF'
 # network-kill-switch settings. After editing: sudo launchctl kickstart -k system/local.network-kill-switch
@@ -248,6 +260,13 @@ if [ "${CHECK}" = 1 ]; then
 fi
 
 step "Done"
+if [ -f "${CVL_WATCH_PLIST}" ]; then
+  if bash "${SRC}/watch.sh" --resume; then
+    say "  hourly watch is running again"
+  else
+    say "  WARNING: the hourly watch did not come back. Run: sudo bash '${SRC}/watch.sh' --install"
+  fi
+fi
 "${CVL_DAEMON}" status | sed 's/^/  /'
 say ""
 say "  daemon log:    ${CVL_LOG}"
