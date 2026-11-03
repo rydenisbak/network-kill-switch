@@ -19,10 +19,11 @@ should be no `inet6` line. Put it back later with `sudo networksetup -setv6autom
 System Settings → Network → the service → Details → TCP/IP → Configure IPv6 → **Link-local
 only** is not off: the interface still keeps an `fe80::` address. Use `-setv6off`.
 
-The table starts with Anthropic's nets and adds dedicated addresses the daemon resolves
-(Claude updates and content hosts, Datadog intake, and any other listed name that is not a
-shared CDN). Cloudflare, CloudFront and Fastly answers stay uncovered: one such address
-serves thousands of other sites.
+The table starts with Anthropic's nets and adds addresses the daemon resolves (Claude
+updates and content hosts, Datadog intake, and OpenAI / ChatGPT even when those names sit
+on a shared CDN). Other Cloudflare, CloudFront and Fastly answers stay uncovered: one such
+address serves thousands of other sites. OpenAI and ChatGPT are the exception, so other
+sites on those same addresses also leave only through the tunnel.
 
 Covers every program at once. macOS only. [Русская версия](README.ru.md).
 
@@ -163,12 +164,18 @@ sudo bash uninstall.sh             # removes everything and compares the machine
 ```bash
 sudo /opt/network-kill-switch/network-kill-switch-daemon.sh status
 tail -f /var/log/network-kill-switch.log
+tail -f /var/log/network-kill-switch-blocks.log
 ```
 
 - `STATE open :: ... exit NL 192.0.2.52`: tunnel verified, Claude works.
 - `STATE closed :: no VPN tunnel ...`: no VPN, Claude blocked.
 - `PF rule being replaced had blocked N packets`: how many packets were dropped while that
-  rule was in place.
+  rule was in place. The counter has no addresses. Each blocked attempt is a line in
+  `network-kill-switch-blocks.log`: the interface it tried to leave on, the source, and
+  the destination address and port. The hourly check appears there once an hour as
+  `203.0.113.7`. The kernel also adds the uid and pid when it knows which socket sent
+  the packet. The file is root-only. If `pflog1` cannot be created, the block stays and
+  this file stays empty.
 
 ## Hourly watch
 
@@ -219,7 +226,7 @@ Reinstalling the lock refreshes the watch script if the watch is already install
   country (fallbacks: `www.cloudflare.com/cdn-cgi/trace`, `ipinfo.io/json`). At start, and then
   every 30 minutes, it resolves the watched names (Anthropic, OpenAI, Datadog, Sentry, and the
   content hosts) with `dig` when that is installed, and with the system resolver. Answers on a
-  shared CDN are not added to the table.
+  shared CDN are not added to the table, except the OpenAI and ChatGPT names.
 - `install.sh` and `check.sh`: one request to `https://api.anthropic.com/` through the tunnel
   (IPv4), never outside it. A test packet to `203.0.113.7`, which is dropped before it leaves.
 - `check.sh` only: `77.88.44.55` (an address many VPN apps route "direct", to show such traffic
@@ -242,16 +249,16 @@ Reinstalling the lock refreshes the watch script if the watch is already install
   `2607:6bc0::/32` (inbound today is `160.79.104.0/23` and `2607:6bc0::/48`). Downloads, assets
   and other dedicated load balancers are resolved at install and every 30 minutes (`dig` plus
   the system resolver) and kept for 30 days. A resolver that stays empty still ages that list.
-  OpenAI and ChatGPT names are resolved the same way. Answers on Cloudflare, CloudFront or
-  Fastly are not installed: one such address is shared with thousands of other sites, and
-  blocking it would break those sites. `status` lists those names under `uncovered`. As of
-  2026 the ChatGPT app and `api.openai.com` are on that shared CDN, so this lock cannot force
-  them through the VPN without taking the CDN with them.
+  OpenAI and ChatGPT names are resolved the same way and installed even when the answer is
+  on Cloudflare, CloudFront or Fastly. Other sites on those same addresses then also leave
+  only through the tunnel; that is intentional. Every other shared-CDN answer stays out of
+  the table, and `status` lists those names under `uncovered`.
   `claudeusercontent.com`, `www.claudeusercontent.com`, `claudemcpcontent.com` and
   `www.claudemcpcontent.com` are on the learn list. The names that resolve today sit inside
   `160.79.104.0/21`, so the pinned net already blocks them; a later move off that net is
-  learned. `datadoghq.com` is watched too. Its apex is CloudFront (`3.168.0.0/14`), so those
-  addresses stay uncovered. The telemetry host `http-intake.logs.us5.datadoghq.com` is learned
+  learned. `datadoghq.com` is watched too. Its apex is CloudFront (`3.168.0.0/14`). The shared-CDN
+  list does not cover every CloudFront range, so some apex answers are still learned and
+  blocked. That only adds blocking. The telemetry host `http-intake.logs.us5.datadoghq.com` is learned
   when it has a dedicated address. Exact names only: `*.datadoghq.com` is not implied.
   A DNS answer that is not an address, such as a CNAME, is ignored. When the rule closes or
   the trusted interface name changes, existing pf states to the watched nets are dropped, so
@@ -288,7 +295,7 @@ check, the VPN switched off and on by hand, uninstall, reinstall. From that run 
   rule survives, other anchors unchanged.
 - Uninstall: the machine matches the pre-install snapshot line by line.
 
-The daemon's logic is also covered by `tests/sim.sh`: 96 checks on fake `pfctl`, `route`,
+The daemon's logic is also covered by `tests/sim.sh`: 103 checks on fake `pfctl`, `route`,
 `ifconfig`, `curl` and a fake clock, no root needed. It runs on every push.
 
 ## Development

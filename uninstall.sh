@@ -33,7 +33,7 @@ if [ "${DRY}" = 1 ]; then
   - empty the pf anchor ${CVL_ANCHOR} (and the test anchor ${CVL_TEST_ANCHOR})
   - release our reference that keeps pf enabled (pfctl -X <token>): pf switches off only if
     nothing else holds it
-  - delete ${CVL_DEST_DIR} (daemon, settings, state) and ${CVL_LOG}
+  - delete ${CVL_DEST_DIR} (daemon, settings, state), ${CVL_LOG} and ${CVL_BLOCK_LOG}
     (the log, the settings and the snapshot are copied to ~/Library/Logs/network-kill-switch first)
   - compare the machine with the snapshot taken before install
 PLAN
@@ -132,7 +132,8 @@ if [ -n "${LOGS}" ] && { [ -d "${CVL_SNAP}" ] || [ -f "${CVL_CONF}" ] || [ -f "$
   chown -R "$(cvl_user)" "${keep}" 2>/dev/null
   say "  snapshot and settings saved: ${keep}"
 fi
-for f in "${CVL_DEST_DIR}" "${CVL_LOG}" "${CVL_LOG}.1" /var/log/network-kill-switch.out.log /var/log/network-kill-switch.err.log \
+for f in "${CVL_DEST_DIR}" "${CVL_LOG}" "${CVL_LOG}.1" "${CVL_BLOCK_LOG}" "${CVL_BLOCK_LOG}.1" \
+         /var/log/network-kill-switch.out.log /var/log/network-kill-switch.err.log \
          "${CVL_WATCH_LOG}" "${CVL_WATCH_ERR}"; do
   [ -e "${f}" ] && rm -rf "${f}" && say "  deleted ${f}"
 done

@@ -16,6 +16,7 @@ CVL_TG_CONF="${CVL_DEST_DIR}/telegram.conf"
 CVL_WATCH_LOG=/var/log/network-kill-switch-watch.log
 CVL_WATCH_ERR=/var/log/network-kill-switch-watch.err.log
 CVL_LOG=/var/log/network-kill-switch.log
+CVL_BLOCK_LOG=/var/log/network-kill-switch-blocks.log
 CVL_ANCHOR=com.apple/000.NetworkKillSwitch
 CVL_TEST_ANCHOR=com.apple/001.NetworkKillSwitchTest
 

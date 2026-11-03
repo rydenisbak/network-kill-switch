@@ -192,7 +192,8 @@ COUNTRY_INTERVAL=30
 # failed checks (5).
 COUNTRY_FAIL=open
 # Extra names to resolve into the block table, added to the built-in list. Shared CDN
-# answers are ignored. Example: EXTRA_DOMAINS="updates.example.com"
+# answers are ignored, except the built-in OpenAI and ChatGPT names. Example:
+# EXTRA_DOMAINS="updates.example.com"
 EXTRA_DOMAINS=""
 CONF
   chown root:wheel "${CVL_CONF}"

@@ -28,7 +28,7 @@ check_not() { local what="$1"; shift; if "$@"; then bad "${what}"; else ok "${wh
 cat >"${BIN}/pfctl" <<'EOF'
 #!/bin/bash
 W="${CVL_WORLD}"
-anchor=""; table=""; op=""; file=""; show=""; verbose=0
+anchor=""; table=""; op=""; file=""; show=""; verbose=0; dry=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -a) anchor="$2"; shift ;;
@@ -37,6 +37,7 @@ while [ $# -gt 0 ]; do
     -f) file="$2"; shift ;;
     -s) show="$2"; shift ;;
     -v) verbose=1 ;;
+    -n) dry=1 ;;
     -E) echo yes >"$W/pf_enabled"; n=$(( $(cat "$W/token_seq" 2>/dev/null || echo 1000) + 1 )); echo "$n" >"$W/token_seq"
         echo "$n" >>"$W/refs"; printf 'pf enabled\nToken : %s\n' "$n"; exit 0 ;;
     -X) grep -vx "$2" "$W/refs" >"$W/refs.tmp" 2>/dev/null; mv "$W/refs.tmp" "$W/refs"; echo "released $2" >>"$W/pf_calls"; shift ;;
@@ -61,8 +62,14 @@ fi
 if [ -n "$table" ] && [ "$op" = show ]; then cat "$W/table" 2>/dev/null; exit 0; fi
 if [ -n "$table" ] && [ "$op" = replace ]; then cp "$file" "$W/table"; exit 0; fi
 if [ "$file" = - ]; then
-  [ -f "$W/fail_load" ] && { cat >/dev/null; echo "stdin:2: syntax error" >&2; exit 1; }
-  cat >"$W/anchor"; echo 0 >"$W/packets"
+  body=$(cat)
+  [ -f "$W/fail_load" ] && { echo "stdin:2: syntax error" >&2; exit 1; }
+  if [ "$dry" != 1 ] && [ -f "$W/fail_logged_load" ] && printf '%s\n' "$body" | grep -q 'log (user'; then
+    echo "kernel rejected log" >&2
+    exit 1
+  fi
+  if [ "$dry" = 1 ]; then exit 0; fi
+  printf '%s\n' "$body" >"$W/anchor"; echo 0 >"$W/packets"
   sed -n '1p' "$W/anchor" | sed 's/.*{ *//; s/ *}.*//; s/, */\n/g' | tr -s ' ' >"$W/table"
   exit 0
 fi
@@ -108,7 +115,7 @@ if [ -f "$W/curl_delay" ]; then
 fi
 case "$url" in
   *cdn-cgi/trace*)
-    if [ "$iface" = 192.168.1.20 ]; then printf 'ip=%s\nloc=RU\n' "$(cat "$W/home_ip")"; exit 0; fi
+    if [ "$iface" = 192.168.1.20 ] || [ "$iface" = en0 ]; then printf 'ip=%s\nloc=RU\n' "$(cat "$W/home_ip")"; exit 0; fi
     e=$(cat "$W/exit")
     [ "$e" = fail ] && exit 28
     printf 'fl=1\nip=%s\nts=1\nloc=%s\n' "${e#* }" "${e%% *}"; exit 0 ;;
@@ -411,14 +418,14 @@ reset_world; lib; COUNTRY_WAIT_MAX=1; echo "NL 192.0.2.52" >"${W}/exit"; rm -f "
 v=$( PATH="${SIM}/clock:${PATH}"; check_exit 198.18.0.1 >/dev/null; printf '%s' "${VERDICT}" )
 check "exit found despite the boundary (${v})" [ "${v}" = "exit NL 192.0.2.52" ]
 
-printf '== 29. shared CDN answers are not installed; link-local and multicast neither\n'
+printf '== 29. OpenAI CDN answers are installed; other shared CDNs, link-local and multicast are not\n'
 reset_world
 printf '104.16.1.1\n' >"${W}/dns/chatgpt.com"
 printf 'fe90::1\nff02::1\n' >"${W}/dns/api.claude.ai"
 lib
 learn
-check_not "cloudflare address not learned" grep -q '^104.16.1.1 ' "${SIM}/state/learned"
-check "chatgpt.com recorded as uncovered" grep -qx 'chatgpt.com' "${SIM}/state/uncovered"
+check "chatgpt.com cloudflare address learned" grep -q '^104.16.1.1 ' "${SIM}/state/learned"
+check_not "chatgpt.com is not uncovered" grep -qx 'chatgpt.com' "${SIM}/state/uncovered"
 check_not "link-local fe90 not learned" grep -q '^fe90::1 ' "${SIM}/state/learned"
 check_not "multicast not learned" grep -q '^ff02::1 ' "${SIM}/state/learned"
 check "dedicated download address still learned" grep -q '^35.190.46.17 ' "${SIM}/state/learned"
@@ -449,6 +456,36 @@ learn
 check_not "cname not learned" grep -q 'cloudfront' "${SIM}/state/learned"
 check_not "stale cloudfront address dropped" grep -q '^3.171.61.38 ' "${SIM}/state/learned"
 check "dedicated address learned beside the cname" grep -q '^35.190.46.17 ' "${SIM}/state/learned"
+
+printf '== 32. the off-tunnel probe names the physical interface, not its address\n'
+reset_world
+lib
+check "direct iface is en0" [ "$(direct_iface)" = en0 ]
+check "direct addr stays the address" [ "$(direct_addr)" = 192.168.1.20 ]
+
+printf '== 33. a blocked packet is logged only when pflog1 exists\n'
+reset_world
+lib
+check "rule has no log clause until pflog exists" \
+  grep -q 'block return out quick to <nks_nets> label "nks-closed"' <<<"$(anchor_text closed)"
+PFLOG_IF=pflog1
+check "open rule logs the packet to pflog1" \
+  grep -q 'block return out log (user, to pflog1) quick on ! utun9 ' <<<"$(anchor_text utun9)"
+PFLOG_IF=""
+
+printf '== 34. a kernel that rejects the log clause still gets the block\n'
+reset_world
+lib
+touch "${W}/fail_logged_load"
+PFLOG_IF=pflog1
+MODE=open
+PINNED_IF=utun6
+load_rules utun6
+check "block loaded without the log clause" \
+  grep -q 'block return out quick on ! utun6 to <nks_nets> label "nks-offtunnel"' "${W}/anchor"
+check "logged the fallback" grep -q 'loading the block without the log' "${SIM}/daemon.log"
+check "logging disabled after the refusal" [ -z "${PFLOG_IF}" ]
+PFLOG_IF=""
 
 printf '\nsimulation: %s passed, %s failed\n' "${PASS}" "${FAIL}"
 [ -n "${CVL_SIM_KEEP:-}" ] && printf 'world kept in %s\n' "${SIM}" || rm -rf "${SIM}"

@@ -20,8 +20,9 @@
 #     BLOCKED_COUNTRIES (RU, BY by default);
 #   - re-pins on interface events (route monitor) and every TICK seconds;
 #   - holds its own pf enable reference and re-loads the anchor if something flushed it;
-#   - learns dedicated addresses for LEARN_DOMAINS (Anthropic, OpenAI, Datadog, Sentry,
-#     and the content hosts). Shared CDN answers are not added.
+#   - learns addresses for LEARN_DOMAINS (Anthropic, OpenAI, Datadog, Sentry, and the
+#     content hosts). Shared CDN answers are not added, except the OpenAI and ChatGPT
+#     names in CDN_BLOCK_DOMAINS: those addresses are blocked anyway.
 #
 # Commands: run | once | status | verify | version
 # Sourced with CVL_LIB=1 it only defines functions (used by check.sh and the tests).
@@ -30,13 +31,14 @@
 set -uo pipefail
 export LC_ALL=C
 
-VERSION=1.3.0
+VERSION=1.3.2
 
 # Everything lives under /opt/network-kill-switch, owned by root. Not /usr/local: on an Intel Mac
 # with Homebrew /usr/local/* belongs to the user, who could then swap what root runs.
 CONFIG="${CVL_CONFIG:-/opt/network-kill-switch/network-kill-switch.conf}"
 STATE_DIR="${CVL_STATE_DIR:-/opt/network-kill-switch/state}"
 LOG="${CVL_LOG:-/var/log/network-kill-switch.log}"
+BLOCK_LOG="${CVL_BLOCK_LOG:-/var/log/network-kill-switch-blocks.log}"
 ETC_HOSTS="${CVL_HOSTS:-/etc/hosts}"
 ANCHOR="${CVL_ANCHOR:-com.apple/000.NetworkKillSwitch}"
 PFCTL="${CVL_PFCTL:-/sbin/pfctl}"
@@ -44,6 +46,7 @@ ROUTE="${CVL_ROUTE:-/sbin/route}"
 IFCONFIG="${CVL_IFCONFIG:-/sbin/ifconfig}"
 NETSTAT="${CVL_NETSTAT:-/usr/sbin/netstat}"
 CURL="${CVL_CURL:-/usr/bin/curl}"
+TCPDUMP="${CVL_TCPDUMP:-/usr/sbin/tcpdump}"
 DSCACHEUTIL="${CVL_DSCACHEUTIL:-/usr/bin/dscacheutil}"
 # dig is used only with the real resolver. The simulator points DSCACHEUTIL at a fake and must
 # not leak out to the network. CVL_DIG overrides either way.
@@ -58,12 +61,15 @@ CANARY_NET="203.0.113.7"                       # TEST-NET-3: lets verify prove t
 ROUTE_PROBE="160.79.104.10"                    # only asked of the routing table, never sent to
 # Names the daemon resolves into the block table. Most Anthropic API traffic already sits in
 # PINNED_NETS (inbound 160.79.104.0/23 and 2607:6bc0::/48 are inside those wider nets). The rest
-# are dedicated load balancers: updates, downloads, assets. OpenAI / ChatGPT names are resolved
-# the same way. Answers that fall in a shared CDN (Cloudflare, CloudFront, Fastly) are NOT added:
-# one such address serves thousands of unrelated sites. Those names are listed in the uncovered
-# file instead. Deliberately not listed here either: a-cdn.claude.ai, *.mcp.claude.com,
-# status.claude.com (CloudFront / shared front ends, static files and the status page).
+# are dedicated load balancers: updates, downloads, assets. Answers that fall in a shared CDN
+# (Cloudflare, CloudFront, Fastly) are NOT added: one such address serves thousands of unrelated
+# sites. Those names are listed in the uncovered file instead. Deliberately not listed here
+# either: a-cdn.claude.ai, *.mcp.claude.com, status.claude.com (CloudFront / shared front ends,
+# static files and the status page).
 LEARN_DOMAINS="api.anthropic.com claude.ai api.claude.ai claude.com platform.claude.com console.anthropic.com mcp-proxy.anthropic.com code.claude.com a.claude.ai a-api.anthropic.com assets-proxy.anthropic.com www.anthropic.com releases.claude.com downloads.claude.ai a-cdn.anthropic.com s-cdn.anthropic.com assets.claude.ai statsig.anthropic.com http-intake.logs.us5.datadoghq.com datadoghq.com o1158394.ingest.us.sentry.io api.openai.com chatgpt.com chat.openai.com auth.openai.com platform.openai.com cdn.oaistatic.com files.oaiusercontent.com oaiusercontent.com ab.chatgpt.com ios.chat.openai.com android.chat.openai.com claudeusercontent.com www.claudeusercontent.com claudemcpcontent.com www.claudemcpcontent.com"
+# These names are blocked even when the answer is a shared CDN address. Other sites on that
+# same address then also leave only through the tunnel.
+CDN_BLOCK_DOMAINS="api.openai.com chatgpt.com chat.openai.com auth.openai.com platform.openai.com cdn.oaistatic.com files.oaiusercontent.com oaiusercontent.com ab.chatgpt.com ios.chat.openai.com android.chat.openai.com"
 EXTRA_DOMAINS=""
 LEARN_INTERVAL=1800
 LEARN_MAX_AGE=2592000
@@ -121,6 +127,8 @@ PINNED_IF=""
 LAST_COUNTRY=0
 UNKNOWN_STREAK=0
 VERDICT=""
+PFLOG_IF=""
+PFLOG_PID=""
 
 # ------------------------------------------------------------------ plumbing
 
@@ -136,6 +144,12 @@ rotate_log() {
   local size
   size=$(stat -f %z "${LOG}" 2>/dev/null || printf 0)
   [ "${size}" -gt "${LOG_MAX_BYTES}" ] 2>/dev/null && mv -f "${LOG}" "${LOG}.1"
+  size=$(stat -f %z "${BLOCK_LOG}" 2>/dev/null || printf 0)
+  if [ "${size}" -gt "${LOG_MAX_BYTES}" ] 2>/dev/null; then
+    mv -f "${BLOCK_LOG}" "${BLOCK_LOG}.1"
+    stop_block_log
+    start_block_log
+  fi
   return 0
 }
 
@@ -236,11 +250,19 @@ instance_of() { printf '%s\n' "$1" | awk '{ print $1, $2, $3 }'; }
 
 first_addr() { printf '%s\n' "$1" | awk '{ split($4, a, ","); print a[1] }'; }
 
-# Address of the physical interface behind the non-VPN default route (diagnostics only).
+# Name of the physical interface behind the non-VPN default route.
+# curl --interface needs this name. An address only sets the source; on this Mac the packet
+# then follows the VPN default route into the tunnel, the off-tunnel rule never sees it, and
+# the canary times out (curl 28) without the rule counter moving.
+direct_iface() {
+  "${NETSTAT}" -rn -f inet 2>/dev/null \
+    | awk '$1 == "default" && $NF !~ /^(utun|ipsec|ppp|tun|tap)/ { print $NF; exit }'
+}
+
+# Address of that interface (diagnostics only).
 direct_addr() {
   local ifc
-  ifc=$("${NETSTAT}" -rn -f inet 2>/dev/null \
-        | awk '$1 == "default" && $NF !~ /^(utun|ipsec|ppp|tun|tap)/ { print $NF; exit }')
+  ifc=$(direct_iface) || return 1
   [ -n "${ifc}" ] || return 1
   "${IFCONFIG}" "${ifc}" 2>/dev/null | awk '/[ \t]inet / { print $2; exit }'
 }
@@ -379,6 +401,15 @@ ip4_in_cidr() {
   [ $(( ipi & mask )) -eq $(( net & mask )) ]
 }
 
+# Status 0 when this name is blocked even if its address is a shared CDN.
+cdn_block_domain() {
+  local h
+  for h in ${CDN_BLOCK_DOMAINS}; do
+    [ "$1" = "${h}" ] && return 0
+  done
+  return 1
+}
+
 # Status 0 when this address must not enter the block table.
 shared_cdn() {
   local c
@@ -416,26 +447,97 @@ nets_list() {
 }
 
 # $1 = closed | <interface name>
+# When PFLOG_IF is set, the same block also logs the packet that starts the attempt
+# (interface, addresses, ports, and the uid/pid when the kernel knows them).
 anchor_text() {
-  local nets
+  local nets logged=""
   nets=$(nets_list | paste -s -d, - | sed 's/,/, /g')
+  [ -n "${PFLOG_IF}" ] && logged="log (user, to ${PFLOG_IF}) "
   printf 'table <nks_nets> persist { %s }\n' "${nets}"
   if [ "$1" = closed ]; then
-    printf 'block return out quick to <nks_nets> label "nks-closed"\n'
+    printf 'block return out %squick to <nks_nets> label "nks-closed"\n' "${logged}"
   else
-    printf 'block return out quick on ! %s to <nks_nets> label "nks-offtunnel"\n' "$1"
+    printf 'block return out %squick on ! %s to <nks_nets> label "nks-offtunnel"\n' "${logged}" "$1"
   fi
 }
 
+# A private pflog interface, so this file is only packets our rule returned.
+# If it cannot be created, the block is unchanged and simply does not log.
+prepare_pflog() {
+  PFLOG_IF=""
+  "${IFCONFIG}" pflog1 >/dev/null 2>&1 || "${IFCONFIG}" pflog1 create >/dev/null 2>&1 || return 1
+  PFLOG_IF=pflog1
+  return 0
+}
+
+start_block_log() {
+  [ -n "${PFLOG_IF}" ] || return 0
+  if [ -n "${PFLOG_PID}" ] && kill -0 "${PFLOG_PID}" 2>/dev/null; then
+    return 0
+  fi
+  touch "${BLOCK_LOG}" 2>/dev/null || return 0
+  chmod 600 "${BLOCK_LOG}" 2>/dev/null || true
+  "${TCPDUMP}" -n -l -tttt -i "${PFLOG_IF}" >>"${BLOCK_LOG}" 2>&1 &
+  PFLOG_PID=$!
+  log "packet log ${BLOCK_LOG} via ${PFLOG_IF} pid=${PFLOG_PID}"
+  return 0
+}
+
+stop_block_log() {
+  if [ -n "${PFLOG_PID}" ]; then
+    kill "${PFLOG_PID}" 2>/dev/null
+    wait "${PFLOG_PID}" 2>/dev/null
+  fi
+  PFLOG_PID=""
+  return 0
+}
+
+# Reload the current block in place so it logs. Does not close the tunnel and does not
+# drop existing states: only the rule text gains a log clause.
+enable_packet_log() {
+  local rule
+  prepare_pflog || return 0
+  rule=$(anchor_rule)
+  [ -n "${rule}" ] || return 0
+  case "${rule}" in
+    *"to ${PFLOG_IF}"*) return 0 ;;
+  esac
+  if [ "${MODE}" = open ] && [ -n "${PINNED_IF}" ]; then
+    load_rules "${PINNED_IF}" || return 0
+  else
+    load_rules closed || return 0
+  fi
+  [ -n "${PFLOG_IF}" ] && log "PF rule now logs blocked packets to ${BLOCK_LOG}"
+  return 0
+}
+
+rules_parse() {
+  printf '%s\n' "$1" | "${PFCTL}" -n -a "${ANCHOR}" -f - >/dev/null 2>&1
+}
+
 load_rules() {
-  local prev out
+  local prev out text
+  text=$(anchor_text "$1")
+  if [ -n "${PFLOG_IF}" ] && ! rules_parse "${text}"; then
+    PFLOG_IF=""
+    text=$(anchor_text "$1")
+    log "WARN pf refused the packet log; the block stays, without a destination log"
+  fi
   prev=$(rule_packets)
-  if out=$(anchor_text "$1" | "${PFCTL}" -a "${ANCHOR}" -f - 2>&1); then
+  if out=$(printf '%s\n' "${text}" | "${PFCTL}" -a "${ANCHOR}" -f - 2>&1); then
     if [ "${prev:-0}" -gt 0 ] 2>/dev/null; then
       log "PF rule being replaced had blocked ${prev} packets"
       counter_add blocked_packets "${prev}"
     fi
     return 0
+  fi
+  # The dry run can accept a log clause the kernel then rejects. Drop the log and
+  # load the block once more, so a logging failure cannot freeze the previous rule.
+  if [ -n "${PFLOG_IF}" ]; then
+    PFLOG_IF=""
+    log "WARN pf refused the logged rule at load; loading the block without the log"
+    load_rules "$1"
+    return $?
   fi
   log "ERROR loading anchor (${1}): $(printf '%s' "${out}" | tr '\n' ' ' | cut -c1-300)"
   counter_bump pf_load_failed
@@ -479,7 +581,7 @@ write_learned() {
     | while read -r ip ts host; do
         [ -n "${ip}" ] || continue
         valid_public "${ip}" || continue
-        shared_cdn "${ip}" && continue
+        shared_cdn "${ip}" && ! cdn_block_domain "${host}" && continue
         printf '%s %s %s\n' "${ip}" "${ts}" "${host}"
       done \
     | sort >"${LEARNED_FILE}.tmp" && mv -f "${LEARNED_FILE}.tmp" "${LEARNED_FILE}"
@@ -512,7 +614,7 @@ learn() {
       while read -r ip; do
         [ -n "${ip}" ] || continue
         valid_public "${ip}" || continue
-        if shared_cdn "${ip}"; then
+        if shared_cdn "${ip}" && ! cdn_block_domain "${host}"; then
           cdn=1
           continue
         fi
@@ -609,10 +711,10 @@ check_exit() {
 
 # Why the exit is in a blocked country: the VPN app routed past its tunnel, or the server is there.
 explain_blocked_exit() {
-  local exit_ip="$1" addr home
-  addr=$(direct_addr) || addr=""
-  [ -n "${addr}" ] || return 0
-  home=$("${CURL}" -s -m 3 --interface "${addr}" https://1.1.1.1/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+  local exit_ip="$1" ifc home
+  ifc=$(direct_iface) || ifc=""
+  [ -n "${ifc}" ] || return 0
+  home=$("${CURL}" -s -m 3 --interface "${ifc}" https://1.1.1.1/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
   if [ -n "${home}" ] && [ "${home}" = "${exit_ip}" ]; then
     printf ' (the VPN app sends flows past its tunnel: exit = this network'"'"'s own address)'
     counter_bump vpn_bypass_seen
@@ -862,6 +964,7 @@ maybe_tick() {
   if [ $((now - LAST_LEARN)) -ge "${LEARN_INTERVAL}" ]; then
     kick_learn
   fi
+  [ $((TICKS % 12)) -eq 0 ] && start_block_log
   [ $((TICKS % 120)) -eq 0 ] && rotate_log
   return 0
 }
@@ -870,12 +973,14 @@ cmd_run() {
   local line started fast_fails=0 backoff resume_at
   mkdir -p "${STATE_DIR}" 2>/dev/null
   touch "${LOG}" 2>/dev/null
-  trap 'stop_learn; stop_monitor; log "STOP pid=$$"; exit 0' TERM INT
+  trap 'stop_learn; stop_block_log; stop_monitor; log "STOP pid=$$"; exit 0' TERM INT
   rm -rf "${COUNTER_FILE}.lock"   # left by a killed predecessor; nothing else writes yet
   log "START network-kill-switch ${VERSION} pid=$$ anchor=${ANCHOR}"
   [ -n "${CONFIG_IGNORED}" ] && log "WARN config ${CONFIG} ignored: it or a folder above it can be changed by a non-root user"
   pf_take_ref
   restore_or_close
+  enable_packet_log
+  start_block_log
   check_main_anchor
   heal
   evaluate start
@@ -929,6 +1034,7 @@ cmd_once() {
     restore_or_close
     evaluate once
   fi
+  enable_packet_log
   printf 'mode=%s pinned=%s\n' "${MODE}" "${PINNED_ID}"
 }
 
@@ -964,16 +1070,16 @@ cmd_verify() {
     fails=$((fails + 1))
   fi
   pf_enabled || { printf 'FAIL pf is disabled\n'; fails=$((fails + 1)); }
-  addr=$(direct_addr) || addr=""
+  addr=$(direct_iface) || addr=""
   if [ -z "${addr}" ]; then
-    printf 'NOT TESTED no physical interface address: the canary was not sent\n'
+    printf 'NOT TESTED no physical interface: the canary was not sent\n'
     untested=1
   else
     before=$(rule_packets)
     "${CURL}" -s -o /dev/null -m 3 --interface "${addr}" "http://${CANARY_NET}/" 2>/dev/null
     rc=$?
     after=$(rule_packets)
-    printf 'canary from %s: curl exit %s, rule packets %s -> %s\n' "${addr}" "${rc}" "${before}" "${after}"
+    printf 'canary on %s: curl exit %s, rule packets %s -> %s\n' "${addr}" "${rc}" "${before}" "${after}"
     if [ "${after}" -gt "${before}" ] 2>/dev/null; then
       printf 'OK the kernel dropped a packet that tried to leave past the tunnel\n'
     else

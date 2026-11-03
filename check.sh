@@ -55,7 +55,7 @@ MODE_NOW=$(cat "${CVL_VAR}/mode" 2>/dev/null)
 PIN_NOW=$(cat "${CVL_VAR}/pinned" 2>/dev/null)
 TUN_IF=${PIN_NOW%% *}
 TUN_ADDR=$(first_addr "${PIN_NOW}")
-REAL=$(direct_addr) || REAL=""
+REAL_IF=$(direct_iface) || REAL_IF=""
 
 step "P0. How pf looks right now (for diagnosis, not a check)"
 info "main ruleset: $(pfctl -s rules 2>/dev/null | tr '\n' ';')"
@@ -81,14 +81,14 @@ info "networks in the table: $(pfctl -a "${CVL_ANCHOR}" -t nks_nets -T show 2>/d
 
 step "P2. A packet outside the tunnel is dropped by the kernel (control address ${CANARY_NET})"
 P2_OK=0
-if [ -z "${REAL}" ]; then
-  fail "could not find the address of the physical interface"
+if [ -z "${REAL_IF}" ]; then
+  fail "could not find the physical interface"
 else
   b=$(rule_packets); t0=$(date +%s)
-  curl -s -o /dev/null -m 3 --interface "${REAL}" "http://${CANARY_NET}/"; rc=$?
+  curl -s -o /dev/null -m 3 --interface "${REAL_IF}" "http://${CANARY_NET}/"; rc=$?
   a=$(rule_packets); t1=$(date +%s)
-  info "curl --interface ${REAL} http://${CANARY_NET}/ -> curl code ${rc} in $((t1 - t0)) s; rule counter ${b} -> ${a}"
-  if [ "${a}" -gt "${b}" ] 2>/dev/null; then pass "packet from ${REAL} was dropped (counter +$((a - b)))"; P2_OK=1
+  info "curl --interface ${REAL_IF} http://${CANARY_NET}/ -> curl code ${rc} in $((t1 - t0)) s; rule counter ${b} -> ${a}"
+  if [ "${a}" -gt "${b}" ] 2>/dev/null; then pass "packet on ${REAL_IF} was dropped (counter +$((a - b)))"; P2_OK=1
   else fail "counter did not go up; the packet did not hit the rule"; fi
   [ "${rc}" = 7 ] && info "code 7 = connection refused at once (block return): the program does not wait for a timeout"
 fi
@@ -104,9 +104,9 @@ if [ "${SHORT}" = 0 ]; then
 step "P4. A real Anthropic address (160.79.104.10) from the physical interface"
 if [ "${P2_OK}" = 1 ]; then
   b=$(rule_packets)
-  curl -s -o /dev/null -k -m 3 --interface "${REAL}" https://160.79.104.10/; rc=$?
+  curl -s -o /dev/null -k -m 3 --interface "${REAL_IF}" https://160.79.104.10/; rc=$?
   a=$(rule_packets)
-  info "curl --interface ${REAL} https://160.79.104.10/ -> curl code ${rc}; counter ${b} -> ${a}"
+  info "curl --interface ${REAL_IF} https://160.79.104.10/ -> curl code ${rc}; counter ${b} -> ${a}"
   [ "${a}" -gt "${b}" ] 2>/dev/null && [ "${rc}" != 0 ] && pass "dropped by the kernel, did not reach Anthropic" || fail "NOT dropped"
 else
   info "skipped: P2 did not prove the drop, so nothing is sent to Anthropic from the real address"
